@@ -14,6 +14,10 @@ const RISE = {
 };
 const DAWN_KEY = "films/dawn-2014-r1.mp4";
 const DAWN_ID = "dawn-2014-r1";
+const DAWN = {
+  slug: "dawn", id: DAWN_ID, name: "Dawn of the Planet of the Apes (2014)",
+  size: 2669627101, duration: 7824.277, type: "video/mp4", width: 1920, height: 1040
+};
 const previewNames = {
   rise: "rise-of-the-planet-of-the-apes",
   dawn: "dawn-of-the-planet-of-the-apes"
@@ -24,13 +28,7 @@ const position = (playback, at) => playback.position + (playback.playing ? Math.
 
 async function findDawn(env) {
   const file = await env.MEDIA.head(DAWN_KEY);
-  const duration = Number(file?.customMetadata?.duration);
-  if (!file || !Number.isFinite(duration) || duration <= 0 ||
-      file.size !== Number(file.customMetadata.size)) return null;
-  return {
-    slug: "dawn", id: DAWN_ID, name: "Dawn of the Planet of the Apes (2014)",
-    size: file.size, duration, type: "video/mp4", width: 1920, height: 1040
-  };
+  return file?.size === DAWN.size ? DAWN : null;
 }
 
 function roomCode() {
