@@ -59,8 +59,8 @@ export default {
       if (!(await env.CREATE_LIMIT.limit({ key })).success) {
         response = fail("Room limit reached. Try again in a minute.", 429);
       } else {
-        const choice = request.body ? await readText(request, 32) : "rise";
-        const video = choice === "rise" ? RISE : choice === "dawn" ? await findDawn(env) : null;
+        const choice = request.body ? await readText(request, 32) : "";
+        const video = choice === "" || choice === "rise" ? RISE : choice === "dawn" ? await findDawn(env) : null;
         response = fail("This film is unavailable.", 404);
         if (video) {
           for (let attempt = 0; attempt < 3; attempt++) {
