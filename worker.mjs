@@ -2,16 +2,36 @@ import { DurableObject } from "cloudflare:workers";
 
 const LIFETIME = 7 * 86400_000;
 const CODE = /^[A-HJ-NP-Z2-9]{10}$/;
-const FILM = {
+const RISE = {
+  slug: "rise",
   id: "9392a7f4-5208-4620-a7fc-4388f25450b5",
   size: 1743148283,
   duration: 6296.540125,
   type: "video/mp4",
+  width: 1920,
+  height: 816,
   name: "Rise of the Planet of the Apes (2011)"
+};
+const DAWN_KEY = "films/dawn-2014-r1.mp4";
+const DAWN_ID = "dawn-2014-r1";
+const previewNames = {
+  rise: "rise-of-the-planet-of-the-apes",
+  dawn: "dawn-of-the-planet-of-the-apes"
 };
 const json = (data, status = 200) => Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
 const fail = (error, status = 400) => json({ error }, status);
 const position = (playback, at) => playback.position + (playback.playing ? Math.max(0, at - playback.at) / 1000 : 0);
+
+async function findDawn(env) {
+  const file = await env.MEDIA.head(DAWN_KEY);
+  const duration = Number(file?.customMetadata?.duration);
+  if (!file || !Number.isFinite(duration) || duration <= 0 ||
+      file.size !== Number(file.customMetadata.size)) return null;
+  return {
+    slug: "dawn", id: DAWN_ID, name: "Dawn of the Planet of the Apes (2014)",
+    size: file.size, duration, type: "video/mp4", width: 1920, height: 1040
+  };
+}
 
 function roomCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -31,15 +51,25 @@ export default {
         "Access-Control-Allow-Headers": "Content-Type, Range",
         "Access-Control-Max-Age": "7200"
       } });
+    } else if (pathname === "/api/films" && request.method === "GET") {
+      const films = [RISE, await findDawn(env)].filter(Boolean);
+      response = json(films.map(({ slug, name }) => ({ slug, name })));
     } else if (pathname === "/api/rooms" && request.method === "POST") {
       const key = request.headers.get("CF-Connecting-IP") || "local";
       if (!(await env.CREATE_LIMIT.limit({ key })).success) {
         response = fail("Room limit reached. Try again in a minute.", 429);
       } else {
-        for (let attempt = 0; attempt < 3; attempt++) {
-          const code = roomCode();
-          response = await env.ROOMS.getByName(code).fetch("https://room/init", { method: "POST", body: code });
-          if (response.status !== 409) break;
+        const choice = request.body ? await readText(request, 32) : "rise";
+        const video = choice === "rise" ? RISE : choice === "dawn" ? await findDawn(env) : null;
+        response = fail("This film is unavailable.", 404);
+        if (video) {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const code = roomCode();
+            response = await env.ROOMS.getByName(code).fetch("https://room/init", {
+              method: "POST", body: JSON.stringify({ code, video })
+            });
+            if (response.status !== 409) break;
+          }
         }
       }
     } else {
@@ -69,8 +99,8 @@ export class Room extends DurableObject {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       this.room = await ctx.storage.get("room");
-      if (this.room?.video?.id === FILM.id || !this.room) return;
-      this.room.video = FILM;
+      if (!this.room || [RISE.id, DAWN_ID].includes(this.room.video?.id)) return;
+      this.room.video = RISE;
       this.room.caption = null;
       this.room.previous = null;
       this.room.playback = { at: Date.now(), position: 0, playing: false, jump: 0 };
@@ -78,9 +108,13 @@ export class Room extends DurableObject {
     });
   }
 
+  get video() {
+    return this.room.video?.id === DAWN_ID ? this.room.video : RISE;
+  }
+
   snapshot() {
     const { code, caption, playback, previous, revision, pending } = this.room;
-    return { code, video: FILM, caption, playback, previous, revision, prepare: pending?.id ?? null };
+    return { code, video: this.video, caption, playback, previous, revision, prepare: pending?.id ?? null };
   }
 
   async save() {
@@ -97,10 +131,10 @@ export class Room extends DurableObject {
     const method = request.method;
     if (url.pathname === "/init") {
       if (this.room) return fail("Code in use.", 409);
-      const code = await request.text();
+      const { code, video } = await request.json();
       const now = Date.now();
       this.room = {
-        code, until: now + LIFETIME, video: FILM, caption: null, revision: 0,
+        code, until: now + LIFETIME, video, caption: null, revision: 0,
         playback: { at: now, position: 0, playing: false, jump: 0 }
       };
       await this.ctx.storage.put("room", this.room);
@@ -142,7 +176,8 @@ export class Room extends DurableObject {
       return;
     }
     const { caption, playback, previous } = this.room;
-    if (message.video !== FILM.id) return;
+    const video = this.video;
+    if (message.video !== video.id) return;
     if (message.type === "prepared" && this.room.pending?.id === message.position) {
       const attendee = socket.deserializeAttachment();
       if (attendee) {
@@ -167,12 +202,12 @@ export class Room extends DurableObject {
     if (message.type === "seek") target = message.position;
     if (message.type === "skip") target += Math.max(-30, Math.min(30, message.position));
     const playing = message.type === "play" || (message.type !== "pause" && (pending || playback.playing));
-    if (playing && message.type === "play" && target >= FILM.duration - 0.08) target = 0;
-    target = Math.min(FILM.duration, Math.max(0, target));
+    if (playing && message.type === "play" && target >= video.duration - 0.08) target = 0;
+    target = Math.min(video.duration, Math.max(0, target));
     const jump = playback.jump + (message.type === "pause" ? 0 : 1);
     this.room.previous = message.type === "pause" && !pending ? active : null;
     this.room.playback = { at, position: target, playing: false, jump };
-    this.room.pending = playing && target < FILM.duration ? {
+    this.room.pending = playing && target < video.duration ? {
       id: this.room.revision + 1,
       deadline: now + 14000,
       attendees: this.ctx.getWebSockets().filter(client => client.readyState === WebSocket.OPEN).map(client => {
@@ -213,12 +248,12 @@ export class Room extends DurableObject {
     return this.ctx.id.toString() + "/" + type + "/" + id;
   }
 
-  filmKey() {
-    return this.env.ROOMS.idFromName(this.env.FILM_SOURCE_ROOM).toString() + "/video/" + FILM.id;
+  riseKey() {
+    return this.env.ROOMS.idFromName(this.env.FILM_SOURCE_ROOM).toString() + "/video/" + RISE.id;
   }
 
   async caption(request, videoId) {
-    if (videoId !== FILM.id) return fail("Film unavailable.", 404);
+    if (videoId !== this.video.id) return fail("Film unavailable.", 404);
     const text = await readText(request, 1024 * 1024);
     if (!text || !/^WEBVTT(?:[\t \r\n]|$)/.test(text) ||
         !/^(?:\d{2,}:)?\d{2}:\d{2}\.\d{3}[ \t]+-->[ \t]+(?:\d{2,}:)?\d{2}:\d{2}\.\d{3}/m.test(text)) {
@@ -235,8 +270,9 @@ export class Room extends DurableObject {
   }
 
   async media(request, type, id) {
-    if (type === "preview" && /^[1-7]$/.test(id)) {
-      const key = "film-previews/rise-of-the-planet-of-the-apes-" + id + ".jpg";
+    const film = this.video;
+    if (type === "preview" && /^[1-9]\d?$/.test(id) && Number(id) <= Math.ceil(film.duration / 960)) {
+      const key = "film-previews/" + previewNames[film.slug] + "-" + id + ".jpg";
       const isHead = request.method === "HEAD";
       const image = await (isHead ? this.env.MEDIA.head(key) : this.env.MEDIA.get(key));
       if (!image) return fail("Preview unavailable.", 404);
@@ -247,7 +283,7 @@ export class Room extends DurableObject {
         ETag: image.httpEtag
       } });
     }
-    const asset = type === "video" ? FILM : type === "caption" ? this.room.caption : null;
+    const asset = type === "video" ? film : type === "caption" ? this.room.caption : null;
     if (!asset || id !== asset.id) return fail("File unavailable.", 404);
     const headers = new Headers({
       "Content-Type": type === "video" ? asset.type : "text/vtt; charset=utf-8",
@@ -271,7 +307,7 @@ export class Room extends DurableObject {
       }
       if (!range) return new Response(null, { status: 416, headers: { "Content-Range": "bytes */" + asset.size } });
     }
-    const key = type === "video" ? this.filmKey() : this.key(id, type);
+    const key = type === "video" ? (film.slug === "dawn" ? DAWN_KEY : this.riseKey()) : this.key(id, type);
     const object = await this.env.MEDIA.get(key, range ? { range } : {});
     if (!object) return fail("File unavailable.", 404);
     headers.set("ETag", object.httpEtag);
@@ -285,7 +321,7 @@ export class Room extends DurableObject {
       await this.env.MEDIA.resumeMultipartUpload(key, uploadId).abort();
     }
     const prefix = this.ctx.id.toString() + "/";
-    const filmKey = this.filmKey();
+    const filmKey = this.riseKey();
     let cursor;
     do {
       const page = await this.env.MEDIA.list({ prefix, cursor });

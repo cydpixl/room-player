@@ -6,8 +6,8 @@
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#111113">
   <title>Room Player</title>
-  <link rel="stylesheet" href="./style.css?v=3">
-  <script type="module" src="./player.js?v=5"></script>
+  <link rel="stylesheet" href="./style.css?v=6">
+  <script type="module" src="./player.js?v=6"></script>
 </head>
 <body>
   <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -31,6 +31,12 @@
       <h1><label for="code">Room code</label></h1>
       <input id="code" type="text" maxlength="12" placeholder="Enter code" autocapitalize="characters" spellcheck="false" required>
       <button class="primary" type="submit">Join room</button>
+      <label class="film-choice" id="filmChoice" hidden>
+        <span>Film</span>
+        <select id="hostFilm">
+          <option value="rise">Rise of the Planet of the Apes (2011)</option>
+        </select>
+      </label>
       <button class="secondary" id="host" type="button">Host room</button>
       <p class="message" id="lobbyMessage" role="status" hidden></p>
     </form>

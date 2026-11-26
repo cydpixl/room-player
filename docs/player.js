@@ -1,4 +1,5 @@
-const API = "https://room-player-sync.cydpixl7.workers.dev/api/rooms";
+const SERVICE = "https://room-player-sync.cydpixl7.workers.dev/api";
+const API = SERVICE + "/rooms";
 const CODE = /^[A-HJ-NP-Z2-9]{10}$/;
 const $ = id => document.getElementById(id);
 const video = $("video");
@@ -92,7 +93,7 @@ async function openRoom(create) {
   status("lobbyMessage");
   try {
     if (create) {
-      const created = await request("", { method: "POST" });
+      const created = await request("", { method: "POST", body: $("hostFilm").value });
       await enter(created.code);
     } else {
       await enter(code);
@@ -103,6 +104,19 @@ async function openRoom(create) {
     joining = false;
     $("host").disabled = false;
     $("joinForm").querySelector("[type=submit]").disabled = false;
+  }
+}
+
+async function loadFilmChoices() {
+  try {
+    const response = await fetch(SERVICE + "/films");
+    if (!response.ok) return;
+    const films = await response.json();
+    if (films.length < 2) return;
+    $("hostFilm").replaceChildren(...films.map(({ name, slug }) => new Option(name, slug)));
+    $("filmChoice").hidden = false;
+  } catch {
+    // The lobby can still host Rise if the catalog request fails.
   }
 }
 
@@ -209,6 +223,9 @@ function receiveState(next) {
   }
   if (state.video?.id !== videoId) {
     videoId = state.video?.id;
+    if (state.video?.width && state.video?.height) {
+      player.style.setProperty("--film-aspect", state.video.width + " / " + state.video.height);
+    }
     appliedJump = undefined;
     autoplayBlocked = false;
     video.pause();
@@ -438,7 +455,7 @@ seek.addEventListener("change", () => {
 function showSeekPreview(seconds) {
   const popup = $("seekPreview");
   const frame = $("previewFrame");
-  const frameNumber = Math.floor(seconds / 12);
+  const frameNumber = Math.min(Math.floor(seconds / 12), Math.ceil(state.video.duration / 12) - 1);
   const sheet = Math.floor(frameNumber / 80) + 1;
   const cell = frameNumber % 80;
   $("previewTime").textContent = showTime(seconds);
@@ -631,3 +648,4 @@ if (initialCode && CODE.test(initialCode)) {
   $("code").value = initialCode;
   void openRoom(false);
 }
+void loadFilmChoices();
