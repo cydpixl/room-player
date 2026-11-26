@@ -143,7 +143,7 @@ export class Room extends DurableObject {
     if (["seek", "skip"].includes(message.type) && !Number.isFinite(message.position)) return;
     const active = previous && now < playback.at ? previous : playback;
     const at = now + 300;
-    let target = position(active, at);
+    let target = position(playback, at);
     if (message.type === "seek") target = message.position;
     if (message.type === "skip") target += Math.max(-30, Math.min(30, message.position));
     const playing = message.type === "play" || (message.type !== "pause" && playback.playing);
@@ -152,7 +152,7 @@ export class Room extends DurableObject {
     this.room.previous = active;
     this.room.playback = {
       at, position: target, playing: playing && target < video.duration,
-      jump: playback.jump + (Math.abs(target - position(active, at)) > 0.01 ? 1 : 0)
+      jump: playback.jump + (Math.abs(target - position(playback, at)) > 0.01 ? 1 : 0)
     };
     await this.save();
   }
@@ -184,7 +184,7 @@ export class Room extends DurableObject {
         const key = this.key(newId, "video");
         const upload = await bucket.createMultipartUpload(key, { httpMetadata: { contentType: type } });
         this.pending = {
-          ...uploadDetails(upload), id: newId, key, type, size: data.size, duration: data.duration,
+          uploadId: upload.uploadId, id: newId, key, type, size: data.size, duration: data.duration,
           name: String(data.name).slice(0, 180)
         };
         await this.ctx.storage.put("pending", this.pending);
@@ -311,10 +311,6 @@ export class Room extends DurableObject {
     this.room = null;
     this.pending = null;
   }
-}
-
-function uploadDetails(upload) {
-  return { uploadId: upload.uploadId };
 }
 
 async function readText(request, limit) {

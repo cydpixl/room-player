@@ -27,7 +27,6 @@ let scrubbing = false;
 let uploading = false;
 let autoplayBlocked = false;
 let starting = false;
-let gestureUntil = 0;
 
 function status(id, text = "") {
   const element = $(id);
@@ -194,7 +193,6 @@ function receiveState(next) {
     videoId = state.video?.id;
     appliedJump = undefined;
     autoplayBlocked = false;
-    gestureUntil = 0;
     video.pause();
     video.playbackRate = 1;
     if (videoId) {
@@ -226,6 +224,10 @@ function nowPlaying() {
   return offset !== undefined && clock() + offset < state.playback.at && state.previous ? state.previous : state.playback;
 }
 
+function atEnd() {
+  return video.ended || (Number.isFinite(video.duration) && video.currentTime >= video.duration - 0.05);
+}
+
 function render() {
   const loaded = Boolean(videoId);
   $("empty").hidden = loaded;
@@ -239,7 +241,7 @@ function render() {
   $("captions").disabled = !state?.caption || !connected;
   $("playToggle").disabled = !loaded || !connected;
   $("enablePlayback").hidden = !autoplayBlocked || !nowPlaying()?.playing;
-  const playing = nowPlaying()?.playing && !video.ended && !autoplayBlocked;
+  const playing = nowPlaying()?.playing && !atEnd() && !autoplayBlocked;
   setIcon("playToggle", playing ? "pause" : "play", playing ? "Pause" : "Play");
   $("captions").setAttribute("aria-pressed", String(Boolean(state?.caption?.enabled)));
 }
@@ -250,7 +252,7 @@ function reconcile() {
   const now = clock() + offset;
   const targetState = nowPlaying();
   const target = Math.min(video.duration, targetState.position + (targetState.playing ? Math.max(0, now - targetState.at) / 1000 : 0));
-  const playing = targetState.playing && target < video.duration - 0.04;
+  const playing = targetState.playing && target < video.duration;
   const boundary = state.playback.at - now;
   syncTimer = setTimeout(reconcile, boundary > 0 ? Math.min(160, Math.max(8, boundary)) : 160);
   if (video.seeking) return;
@@ -258,17 +260,16 @@ function reconcile() {
   const jump = appliedJump !== targetState.jump;
   appliedJump = targetState.jump;
   if (!playing) {
-    if (clock() < gestureUntil && !jump) return;
     if (!video.paused) video.pause();
     if (video.playbackRate !== 1) video.playbackRate = 1;
-    if (Math.abs(delta) > 0.065) video.currentTime = target;
+    if (Math.abs(delta) > 0.025) video.currentTime = target;
   } else {
     const drift = Math.abs(delta);
     if (jump || drift > 1.6 || (video.paused && drift > 0.17)) {
       if (drift > 0.06) video.currentTime = target;
       if (video.playbackRate !== 1) video.playbackRate = 1;
-    } else if (video.readyState >= 3 && drift > 0.045) {
-      video.playbackRate = 1 + Math.max(-0.045, Math.min(0.045, delta * 0.18));
+    } else if (video.readyState >= 3 && drift > 0.022) {
+      video.playbackRate = 1 + Math.max(-0.048, Math.min(0.048, delta * 0.38));
     } else if (video.playbackRate !== 1) {
       video.playbackRate = 1;
     }
@@ -294,7 +295,7 @@ async function startPlayback() {
 
 function togglePlayback() {
   if (!videoId || !connected) return;
-  const playing = state.playback.playing && !video.ended;
+  const playing = state.playback.playing && !atEnd();
   if (autoplayBlocked && playing) {
     autoplayBlocked = false;
     void startPlayback();
@@ -302,8 +303,6 @@ function togglePlayback() {
     act("pause");
   } else {
     autoplayBlocked = false;
-    gestureUntil = clock() + 700;
-    void startPlayback();
     act("play");
   }
 }
