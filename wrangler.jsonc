@@ -1,0 +1,11 @@
+{
+  "name": "room-player-sync",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-26",
+  "upload_source_maps": true,
+  "vars": { "SITE_ORIGIN": "https://cydpixl.github.io" },
+  "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "Room" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "room-player-private-media" }],
+  "ratelimits": [{ "name": "CREATE_LIMIT", "namespace_id": "104", "simple": { "limit": 6, "period": 60 } }]
+}
