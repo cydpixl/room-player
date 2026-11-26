@@ -302,7 +302,10 @@ function reconcile() {
       if (drift > 0.06) video.currentTime = target;
       if (video.playbackRate !== 1) video.playbackRate = 1;
     } else if (video.readyState >= 3 && drift > 0.022) {
-      video.playbackRate = 1 + Math.max(-0.075, Math.min(0.075, delta * 0.6));
+      const justResumed = now - targetState.at < 3500;
+      const maxAdjustment = justResumed ? 0.14 : 0.075;
+      const adjustment = delta * (justResumed ? 1.15 : 0.6);
+      video.playbackRate = 1 + Math.max(-maxAdjustment, Math.min(maxAdjustment, adjustment));
     } else if (video.playbackRate !== 1) {
       video.playbackRate = 1;
     }
