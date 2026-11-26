@@ -2,7 +2,6 @@ import { DurableObject } from "cloudflare:workers";
 
 const LIFETIME = 7 * 86400_000;
 const CODE = /^[A-HJ-NP-Z2-9]{10}$/;
-const FILM_ROOM = "KAUUSDA47J";
 const FILM = {
   id: "9392a7f4-5208-4620-a7fc-4388f25450b5",
   size: 1743148283,
@@ -215,7 +214,7 @@ export class Room extends DurableObject {
   }
 
   filmKey() {
-    return this.env.ROOMS.idFromName(FILM_ROOM).toString() + "/video/" + FILM.id;
+    return this.env.ROOMS.idFromName(this.env.FILM_SOURCE_ROOM).toString() + "/video/" + FILM.id;
   }
 
   async caption(request, videoId) {
