@@ -35,6 +35,7 @@ let hasPlayed = false;
 let prepared;
 let prepareTimer;
 let resyncSince;
+let rateChangedAt = -Infinity;
 let hideTimer;
 const previewImages = new Map();
 let previewSheet;
@@ -290,6 +291,7 @@ function reconcile() {
     if (warming) return;
     if (!video.paused) video.pause();
     if (video.playbackRate !== 1) video.playbackRate = 1;
+    rateChangedAt = -Infinity;
     if (Math.abs(delta) > 0.04) video.currentTime = target;
     else if (state.prepare && prepared !== state.prepare && video.readyState >= 3) {
       prepared = state.prepare;
@@ -301,13 +303,19 @@ function reconcile() {
     if (jump || drift > 2.2 || (video.paused && drift > 0.30 && !autoplayBlocked)) {
       if (drift > 0.06) video.currentTime = target;
       if (video.playbackRate !== 1) video.playbackRate = 1;
-    } else if (video.readyState >= 3 && drift > 0.022) {
-      const justResumed = now - targetState.at < 3500;
-      const maxAdjustment = justResumed ? 0.14 : 0.075;
-      const adjustment = delta * (justResumed ? 1.15 : 0.6);
-      video.playbackRate = 1 + Math.max(-maxAdjustment, Math.min(maxAdjustment, adjustment));
-    } else if (video.playbackRate !== 1) {
-      video.playbackRate = 1;
+      rateChangedAt = -Infinity;
+    } else if (video.readyState >= 3 && now - rateChangedAt >= 1100) {
+      const rate = video.playbackRate;
+      let nextRate = rate;
+      if (rate === 1 && drift > 0.085) {
+        nextRate = 1 + Math.sign(delta) * (drift > 0.16 ? 0.14 : 0.06);
+      } else if (rate !== 1 && (drift < 0.045 || Math.sign(delta) !== Math.sign(rate - 1))) {
+        nextRate = 1;
+      }
+      if (rate !== nextRate) {
+        video.playbackRate = nextRate;
+        rateChangedAt = now;
+      }
     }
     if (drift > 0.60 && !autoplayBlocked && now - targetState.at > 2800) {
       resyncSince ??= now;
