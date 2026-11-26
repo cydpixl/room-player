@@ -4,10 +4,12 @@ const $ = id => document.getElementById(id);
 const video = $("video");
 const player = $("player");
 const seek = $("seek");
+const timeline = $("timeline");
+const controls = $("controls");
+const captionPanel = $("captionPanel");
 const clock = () => performance.now();
 
 let roomCode = "";
-let hostKey = "";
 let state;
 let socket;
 let connected = false;
@@ -24,14 +26,24 @@ let reconnectDelay = 400;
 let joined = false;
 let joining = false;
 let scrubbing = false;
-let uploading = false;
+let scrubPointer = null;
+let uploadingCaption = false;
 let autoplayBlocked = false;
 let starting = false;
+let warming = false;
+let hasPlayed = false;
+let prepared;
+let prepareTimer;
+let resyncSince;
+let hideTimer;
+const previewImages = new Map();
+let previewSheet;
+const hover = matchMedia("(hover: hover)");
 
 function status(id, text = "") {
   const element = $(id);
   element.hidden = !text;
-  element.textContent = text;
+  if (element.textContent !== text) element.textContent = text;
 }
 
 function setIcon(id, symbol, label, pressed) {
@@ -55,9 +67,7 @@ const fileUrl = (type, id) => API + roomPath("media/" + type + "/" + id);
 async function enter(code) {
   const info = await request("/" + code + "/info");
   roomCode = code;
-  hostKey = localStorage.getItem("room-host-" + roomCode) || "";
   $("roomCode").textContent = code.slice(0, 5) + "-" + code.slice(5);
-  $("uploads").hidden = !hostKey;
   $("lobby").hidden = true;
   $("room").hidden = false;
   const url = new URL(location.href);
@@ -82,7 +92,6 @@ async function openRoom(create) {
   try {
     if (create) {
       const created = await request("", { method: "POST" });
-      localStorage.setItem("room-host-" + created.code, created.hostKey);
       await enter(created.code);
     } else {
       await enter(code);
@@ -127,6 +136,7 @@ function connect() {
   connection.addEventListener("open", () => {
     if (socket !== connection) return;
     connected = true;
+    prepared = undefined;
     reconnectDelay = 400;
     samples = [];
     status("playerMessage");
@@ -153,6 +163,8 @@ function connect() {
     if (socket !== connection || !joined) return;
     connected = false;
     clearInterval(pingTimer);
+    clearInterval(prepareTimer);
+    prepareTimer = undefined;
     video.pause();
     render();
     status("playerMessage", "Reconnecting…");
@@ -189,6 +201,11 @@ function act(type, position) {
 function receiveState(next) {
   if (state && next.revision < state.revision) return;
   state = next;
+  if (state.prepare && !prepareTimer) prepareTimer = setInterval(ping, 800);
+  if (!state.prepare && prepareTimer) {
+    clearInterval(prepareTimer);
+    prepareTimer = undefined;
+  }
   if (state.video?.id !== videoId) {
     videoId = state.video?.id;
     appliedJump = undefined;
@@ -231,19 +248,29 @@ function atEnd() {
 function render() {
   const loaded = Boolean(videoId);
   $("empty").hidden = loaded;
-  $("emptyLabel").textContent = hostKey ? "Upload a film" : "Waiting for film";
   $("filename").textContent = state?.video?.name || "";
-  $("captionFile").disabled = !loaded || uploading;
-  $("filmFile").disabled = uploading;
+  $("captionPick").disabled = !loaded || uploadingCaption;
   $("skipBack").disabled = !loaded || !connected;
   $("skipForward").disabled = !loaded || !connected;
   seek.disabled = !loaded || !connected || !Number.isFinite(video.duration);
-  $("captions").disabled = !state?.caption || !connected;
+  $("captions").disabled = !loaded;
+  $("captionToggle").hidden = !state?.caption;
+  $("captionToggle").disabled = !connected;
+  $("captionToggle").textContent = state?.caption?.enabled ? "Turn captions off" : "Turn captions on";
   $("playToggle").disabled = !loaded || !connected;
-  $("enablePlayback").hidden = !autoplayBlocked || !nowPlaying()?.playing;
-  const playing = nowPlaying()?.playing && !atEnd() && !autoplayBlocked;
+  const needsGesture = state?.prepare && !hasPlayed && !warming && video.readyState < 3;
+  $("enablePlayback").hidden = !needsGesture && (!autoplayBlocked || !nowPlaying()?.playing);
+  const playing = (state?.prepare || nowPlaying()?.playing) && !atEnd() && !autoplayBlocked;
   setIcon("playToggle", playing ? "pause" : "play", playing ? "Pause" : "Play");
-  $("captions").setAttribute("aria-pressed", String(Boolean(state?.caption?.enabled)));
+  $("captions").classList.toggle("active", Boolean(state?.caption?.enabled));
+  status("syncNotice", state?.prepare ? "Syncing…" : "");
+}
+
+function roomTime(at = clock() + offset) {
+  const current = nowPlaying();
+  if (!current) return video.currentTime;
+  return Math.min(video.duration || state.video?.duration || Infinity, current.position +
+    (current.playing && Number.isFinite(at) ? Math.max(0, at - current.at) / 1000 : 0));
 }
 
 function reconcile() {
@@ -251,27 +278,42 @@ function reconcile() {
   if (!connected || !videoId || offset === undefined || video.readyState < 1) return;
   const now = clock() + offset;
   const targetState = nowPlaying();
-  const target = Math.min(video.duration, targetState.position + (targetState.playing ? Math.max(0, now - targetState.at) / 1000 : 0));
+  const target = roomTime(now);
   const playing = targetState.playing && target < video.duration;
   const boundary = state.playback.at - now;
-  syncTimer = setTimeout(reconcile, boundary > 0 ? Math.min(160, Math.max(8, boundary)) : 160);
+  syncTimer = setTimeout(reconcile, boundary > 0 ? Math.min(90, Math.max(5, boundary)) : 90);
   if (video.seeking) return;
   const delta = target - video.currentTime;
   const jump = appliedJump !== targetState.jump;
   appliedJump = targetState.jump;
   if (!playing) {
+    if (warming) return;
     if (!video.paused) video.pause();
     if (video.playbackRate !== 1) video.playbackRate = 1;
-    if (Math.abs(delta) > 0.025) video.currentTime = target;
+    if (Math.abs(delta) > 0.04) video.currentTime = target;
+    else if (state.prepare && prepared !== state.prepare && video.readyState >= 3) {
+      prepared = state.prepare;
+      act("prepared", prepared);
+    }
+    resyncSince = undefined;
   } else {
     const drift = Math.abs(delta);
-    if (jump || drift > 1.6 || (video.paused && drift > 0.17)) {
+    if (jump || drift > 2.2 || (video.paused && drift > 0.30 && !autoplayBlocked)) {
       if (drift > 0.06) video.currentTime = target;
       if (video.playbackRate !== 1) video.playbackRate = 1;
     } else if (video.readyState >= 3 && drift > 0.022) {
-      video.playbackRate = 1 + Math.max(-0.048, Math.min(0.048, delta * 0.38));
+      video.playbackRate = 1 + Math.max(-0.075, Math.min(0.075, delta * 0.6));
     } else if (video.playbackRate !== 1) {
       video.playbackRate = 1;
+    }
+    if (drift > 0.60 && !autoplayBlocked && now - targetState.at > 2800) {
+      resyncSince ??= now;
+      if (now - resyncSince > 1000) {
+        resyncSince = now;
+        act("resync");
+      }
+    } else {
+      resyncSince = undefined;
     }
     if (video.paused && !autoplayBlocked) void startPlayback();
   }
@@ -284,6 +326,7 @@ async function startPlayback() {
   starting = true;
   try {
     await video.play();
+    hasPlayed = true;
     autoplayBlocked = false;
   } catch (error) {
     if (error.name === "NotAllowedError") autoplayBlocked = true;
@@ -295,15 +338,31 @@ async function startPlayback() {
 
 function togglePlayback() {
   if (!videoId || !connected) return;
-  const playing = state.playback.playing && !atEnd();
-  if (autoplayBlocked && playing) {
+  const playing = Boolean(state.prepare) || (state.playback.playing && !atEnd());
+  if (autoplayBlocked && state.playback.playing) {
     autoplayBlocked = false;
     void startPlayback();
   } else if (playing) {
     act("pause");
   } else {
     autoplayBlocked = false;
+    if (!hasPlayed && video.readyState < 3) void warmPlayback();
     act("play");
+  }
+}
+
+async function warmPlayback() {
+  if (warming) return;
+  warming = true;
+  try {
+    await video.play();
+    hasPlayed = true;
+  } catch (error) {
+    if (error.name === "NotAllowedError") autoplayBlocked = true;
+  } finally {
+    if (!nowPlaying()?.playing) video.pause();
+    warming = false;
+    reconcile();
   }
 }
 
@@ -315,9 +374,17 @@ function showTime(seconds) {
 }
 
 function updateTime() {
-  if (!scrubbing) seek.value = video.currentTime;
-  $("elapsed").textContent = showTime(Number(seek.value));
-  seek.setAttribute("aria-valuetext", showTime(Number(seek.value)));
+  if (!scrubbing) seek.value = roomTime();
+  const seconds = Number(seek.value);
+  const time = showTime(seconds);
+  $("elapsed").textContent = time;
+  seek.setAttribute("aria-valuetext", time);
+  timeline.style.setProperty("--played", 100 * seconds / Number(seek.max) + "%");
+  let buffered = 0;
+  for (let i = 0; i < video.buffered.length; i++) {
+    if (video.buffered.start(i) - 0.25 <= seconds && seconds <= video.buffered.end(i)) buffered = video.buffered.end(i);
+  }
+  timeline.style.setProperty("--buffered", Math.min(100, 100 * buffered / Number(seek.max)) + "%");
 }
 
 video.addEventListener("loadedmetadata", () => {
@@ -335,30 +402,133 @@ video.addEventListener("error", () => {
   if (videoId) status("playerMessage", "This film could not play. Try an H.264 MP4.");
 });
 $("playToggle").addEventListener("click", togglePlayback);
-$("enablePlayback").addEventListener("click", togglePlayback);
-video.addEventListener("click", togglePlayback);
+$("enablePlayback").addEventListener("click", () => {
+  if (state?.prepare) void warmPlayback();
+  else togglePlayback();
+});
+video.addEventListener("click", () => { if (!player.classList.contains("full")) togglePlayback(); });
 $("skipBack").addEventListener("click", () => act("skip", -10));
 $("skipForward").addEventListener("click", () => act("skip", 10));
-$("captions").addEventListener("click", () => act("captions"));
+$("captions").addEventListener("click", () => setCaptionPanel(captionPanel.hidden));
+$("captionToggle").addEventListener("click", () => act("captions"));
+$("captionPick").addEventListener("click", () => $("captionFile").click());
 $("mute").addEventListener("click", () => { video.muted = !video.muted; });
 video.addEventListener("volumechange", () => setIcon("mute", video.muted ? "muted" : "volume", video.muted ? "Unmute" : "Mute", video.muted));
 seek.addEventListener("input", () => {
   scrubbing = true;
   updateTime();
+  showSeekPreview(Number(seek.value));
 });
 seek.addEventListener("change", () => {
   act("seek", Number(seek.value));
   scrubbing = false;
 });
-seek.addEventListener("pointercancel", () => {
+
+function showSeekPreview(seconds) {
+  const popup = $("seekPreview");
+  const frame = $("previewFrame");
+  const frameNumber = Math.floor(seconds / 12);
+  const sheet = Math.floor(frameNumber / 80) + 1;
+  const cell = frameNumber % 80;
+  $("previewTime").textContent = showTime(seconds);
+  popup.hidden = false;
+  const half = popup.offsetWidth / 2;
+  const x = seconds / Number(seek.max) * timeline.clientWidth;
+  timeline.style.setProperty("--preview-x", Math.max(half, Math.min(timeline.clientWidth - half, x)) + "px");
+  previewSheet = sheet;
+  const url = fileUrl("preview", sheet);
+  frame.style.backgroundPosition = 100 * (cell % 10) / 9 + "% " + 100 * Math.floor(cell / 10) / 7 + "%";
+  if (!previewImages.has(sheet)) {
+    const image = new Image();
+    image.src = url;
+    const entry = { loaded: false };
+    previewImages.set(sheet, entry);
+    image.decode().then(() => {
+      entry.loaded = true;
+      if (previewSheet === sheet) {
+        frame.style.backgroundImage = 'url("' + url + '")';
+        frame.hidden = false;
+      }
+    }).catch(() => previewImages.delete(sheet));
+  }
+  frame.hidden = !previewImages.get(sheet)?.loaded;
+  if (!frame.hidden) frame.style.backgroundImage = 'url("' + url + '")';
+}
+
+function seekAtPointer(event) {
+  const bounds = timeline.getBoundingClientRect();
+  const fraction = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
+  const time = fraction * Number(seek.max);
+  if (scrubbing) {
+    seek.value = time;
+    updateTime();
+  }
+  showSeekPreview(time);
+}
+
+function hideSeekPreview() {
+  $("seekPreview").hidden = true;
+}
+
+seek.addEventListener("pointerdown", event => {
+  if (event.button !== 0 || scrubPointer !== null) return;
+  event.preventDefault();
+  seek.focus({ preventScroll: true });
+  seek.setPointerCapture(event.pointerId);
+  scrubPointer = event.pointerId;
+  scrubbing = true;
+  seekAtPointer(event);
+});
+seek.addEventListener("pointermove", event => {
+  if (!seek.disabled && (event.pointerType === "mouse" || event.pointerId === scrubPointer)) seekAtPointer(event);
+});
+seek.addEventListener("pointerup", event => {
+  if (event.pointerId !== scrubPointer) return;
+  seekAtPointer(event);
+  act("seek", Number(seek.value));
+  scrubPointer = null;
   scrubbing = false;
+  if (event.pointerType !== "mouse") hideSeekPreview();
+});
+seek.addEventListener("lostpointercapture", () => {
+  if (scrubPointer === null) return;
+  scrubPointer = null;
+  scrubbing = false;
+  hideSeekPreview();
   updateTime();
 });
+seek.addEventListener("pointerleave", () => {
+  if (scrubPointer === null) hideSeekPreview();
+});
+seek.addEventListener("blur", hideSeekPreview);
+
+function wakeControls() {
+  if (!player.classList.contains("full")) return;
+  player.classList.add("controls-visible");
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => {
+    if (!(hover.matches && controls.matches(":hover")) && !controls.querySelector(":focus-visible") &&
+        scrubPointer === null && captionPanel.hidden) {
+      player.classList.remove("controls-visible");
+    }
+  }, 1650);
+}
 
 function updateFullscreen() {
   const full = Boolean(document.fullscreenElement) || player.classList.contains("theater");
+  player.classList.toggle("full", full);
+  if (full) wakeControls();
+  else {
+    clearTimeout(hideTimer);
+    player.classList.remove("controls-visible");
+  }
   setIcon("fullscreen", full ? "minimize" : "expand", full ? "Exit full screen" : "Full screen");
 }
+player.addEventListener("pointermove", wakeControls);
+player.addEventListener("pointerdown", wakeControls);
+controls.addEventListener("pointerleave", wakeControls);
+controls.addEventListener("focusin", wakeControls);
+controls.addEventListener("focusout", wakeControls);
 $("fullscreen").addEventListener("click", async () => {
   if (document.fullscreenElement) {
     await document.exitFullscreen();
@@ -377,6 +547,13 @@ $("fullscreen").addEventListener("click", async () => {
 document.addEventListener("fullscreenchange", updateFullscreen);
 document.addEventListener("keydown", event => {
   if (!joined || event.altKey || event.ctrlKey || event.metaKey) return;
+  wakeControls();
+  if (event.key === "Escape" && !captionPanel.hidden) {
+    event.preventDefault();
+    setCaptionPanel(false);
+    $("captions").focus();
+    return;
+  }
   if (event.key === "Escape" && player.classList.contains("theater")) {
     player.classList.remove("theater");
     updateFullscreen();
@@ -394,85 +571,22 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-const authorized = () => ({ Authorization: "Bearer " + hostKey });
-
-async function metadata(file) {
-  const preview = document.createElement("video");
-  const url = URL.createObjectURL(file);
-  const signal = AbortSignal.timeout(12000);
-  try {
-    return await new Promise((resolve, reject) => {
-      const unsupported = () => reject(new Error("Choose a browser-compatible MP4 or WebM film."));
-      preview.onloadedmetadata = () => {
-        if (Number.isFinite(preview.duration) && preview.duration > 0) resolve(preview.duration);
-        else unsupported();
-      };
-      preview.onerror = unsupported;
-      signal.addEventListener("abort", unsupported, { once: true });
-      preview.preload = "metadata";
-      preview.src = url;
-    });
-  } finally {
-    preview.removeAttribute("src");
-    preview.load();
-    URL.revokeObjectURL(url);
-  }
+function setCaptionPanel(open) {
+  captionPanel.hidden = !open;
+  $("captions").setAttribute("aria-expanded", String(open));
+  wakeControls();
 }
-
-async function uploadPart(path, chunk) {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await request(path, { method: "PUT", headers: authorized(), body: chunk });
-    } catch (error) {
-      if (attempt >= 2) throw error;
-      await new Promise(resolve => setTimeout(resolve, 700 * (attempt + 1)));
-    }
-  }
-}
-
-$("filmFile").addEventListener("change", async event => {
-  const file = event.target.files[0];
-  event.target.value = "";
-  if (!file || uploading) return;
-  uploading = true;
-  render();
-  let path;
-  try {
-    if (!/\.(mp4|webm)$/i.test(file.name) || file.size > 3 * 1024 ** 3) throw new Error("Choose an MP4 or WebM film under 3 GB.");
-    status("roomMessage", "Checking film…");
-    const duration = await metadata(file);
-    const session = await request(roomPath("upload"), {
-      method: "POST",
-      headers: { ...authorized(), "Content-Type": "application/json" },
-      body: JSON.stringify({ name: file.name, size: file.size, duration })
-    });
-    path = roomPath("upload/" + session.id);
-    const parts = [];
-    for (let i = 0; i < file.size; i += session.partSize) {
-      const chunk = file.slice(i, i + session.partSize);
-      status("roomMessage", "Uploading film… " + Math.floor(i / file.size * 100) + "%");
-      parts.push(await uploadPart(path + "/" + (parts.length + 1), chunk));
-    }
-    status("roomMessage", "Finishing upload…");
-    receiveState(await request(path + "/complete", {
-      method: "POST",
-      headers: { ...authorized(), "Content-Type": "application/json" },
-      body: JSON.stringify({ parts })
-    }));
-    status("roomMessage");
-  } catch (error) {
-    if (path) await request(path, { method: "DELETE", headers: authorized() }).catch(() => {});
-    status("roomMessage", error.message);
-  } finally {
-    uploading = false;
-    render();
-  }
+document.addEventListener("pointerdown", event => {
+  if (!captionPanel.hidden && !event.target.closest(".caption-control")) setCaptionPanel(false);
 });
 
 $("captionFile").addEventListener("change", async event => {
   const file = event.target.files[0];
   event.target.value = "";
-  if (!file || !videoId || uploading) return;
+  if (!file || !videoId || uploadingCaption) return;
+  uploadingCaption = true;
+  render();
+  status("captionStatus", "Uploading captions…");
   try {
     if (file.size > 1024 * 1024) throw new Error("Choose an SRT or VTT captions file under 1 MB.");
     let text = (await file.text()).replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").trimStart();
@@ -483,18 +597,18 @@ $("captionFile").addEventListener("change", async event => {
     }
     receiveState(await request(roomPath("caption/" + videoId), {
       method: "PUT",
-      headers: { ...authorized(), "Content-Type": "text/vtt" },
+      headers: { "Content-Type": "text/vtt" },
       body: text
     }));
-    status("roomMessage");
+    status("captionStatus", "Captions uploaded.");
   } catch (error) {
-    status("roomMessage", error.message);
+    status("captionStatus", error.message);
+  } finally {
+    uploadingCaption = false;
+    render();
   }
 });
 
-window.addEventListener("beforeunload", event => {
-  if (uploading) event.preventDefault();
-});
 window.addEventListener("pagehide", event => {
   if (event.persisted) return;
   joined = false;

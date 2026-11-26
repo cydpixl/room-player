@@ -1,10 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 
-const PART = 24 * 1024 * 1024;
-const MAX = 3 * 1024 ** 3;
 const LIFETIME = 7 * 86400_000;
 const CODE = /^[A-HJ-NP-Z2-9]{10}$/;
-const TYPES = new Map([["mp4", "video/mp4"], ["webm", "video/webm"]]);
+const FILM_ROOM = "KAUUSDA47J";
+const FILM = {
+  id: "9392a7f4-5208-4620-a7fc-4388f25450b5",
+  size: 1743148283,
+  duration: 6296.540125,
+  type: "video/mp4",
+  name: "Rise of the Planet of the Apes (2011)"
+};
 const json = (data, status = 200) => Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
 const fail = (error, status = 400) => json({ error }, status);
 const position = (playback, at) => playback.position + (playback.playing ? Math.max(0, at - playback.at) / 1000 : 0);
@@ -23,8 +28,8 @@ export default {
     let response;
     if (request.method === "OPTIONS") {
       response = new Response(null, { status: 204, headers: {
-        "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type, Range",
+        "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Range",
         "Access-Control-Max-Age": "7200"
       } });
     } else if (pathname === "/api/rooms" && request.method === "POST") {
@@ -41,8 +46,11 @@ export default {
     } else {
       const [, api, rooms, code, route] = pathname.split("/");
       if (api === "api" && rooms === "rooms" && CODE.test(code) &&
-          ["info", "socket", "upload", "caption", "media"].includes(route)) {
-        response = await env.ROOMS.getByName(code).fetch(request);
+          ["info", "socket", "caption", "media"].includes(route)) {
+        const limited = route === "caption" && request.method === "PUT" &&
+          !(await env.CAPTION_LIMIT.limit({ key: code })).success;
+        response = limited ? fail("Too many caption uploads. Try again in a minute.", 429)
+          : await env.ROOMS.getByName(code).fetch(request);
       } else {
         response = fail("Room not found.", 404);
       }
@@ -62,13 +70,18 @@ export class Room extends DurableObject {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       this.room = await ctx.storage.get("room");
-      this.pending = await ctx.storage.get("pending");
+      if (this.room?.video?.id === FILM.id || !this.room) return;
+      this.room.video = FILM;
+      this.room.caption = null;
+      this.room.previous = null;
+      this.room.playback = { at: Date.now(), position: 0, playing: false, jump: 0 };
+      await this.save();
     });
   }
 
   snapshot() {
-    const { code, video, caption, playback, previous, revision } = this.room;
-    return { code, video, caption, playback, previous, revision };
+    const { code, caption, playback, previous, revision, pending } = this.room;
+    return { code, video: FILM, caption, playback, previous, revision, prepare: pending?.id ?? null };
   }
 
   async save() {
@@ -87,14 +100,13 @@ export class Room extends DurableObject {
       if (this.room) return fail("Code in use.", 409);
       const code = await request.text();
       const now = Date.now();
-      const hostKey = crypto.randomUUID() + crypto.randomUUID();
       this.room = {
-        code, hostKey, until: now + LIFETIME, video: null, caption: null, revision: 0,
+        code, until: now + LIFETIME, video: FILM, caption: null, revision: 0,
         playback: { at: now, position: 0, playing: false, jump: 0 }
       };
       await this.ctx.storage.put("room", this.room);
       await this.ctx.storage.setAlarm(this.room.until);
-      return json({ code, hostKey }, 201);
+      return json({ code }, 201);
     }
     if (!this.room || this.room.until <= Date.now()) return fail("Room not found or expired.", 404);
     const [, , , , route, id, sub] = url.pathname.split("/");
@@ -103,17 +115,14 @@ export class Room extends DurableObject {
       if (this.ctx.getWebSockets().length >= 12) return fail("Room is full.", 429);
       const [client, socket] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(socket);
+      socket.serializeAttachment({ id: crypto.randomUUID(), prepared: null });
       socket.send(JSON.stringify({ type: "state", state: this.snapshot() }));
       return new Response(null, { status: 101, webSocket: client });
     }
     if (route === "media" && ["GET", "HEAD"].includes(method)) {
       return this.media(request, id, sub);
     }
-    if (request.headers.get("Authorization") !== "Bearer " + this.room.hostKey) {
-      return fail("Only the host can upload.", 403);
-    }
     try {
-      if (route === "upload") return await this.upload(request, id, sub);
       if (route === "caption" && method === "PUT") return await this.caption(request, id);
     } catch (error) {
       console.error("Room upload failed", error.message);
@@ -130,132 +139,95 @@ export class Room extends DurableObject {
     const now = Date.now();
     if (message.type === "clock" && Number.isFinite(message.sent)) {
       socket.send(JSON.stringify({ type: "clock", sent: message.sent, server: now }));
+      await this.resumeWhenReady(now);
       return;
     }
-    const { video, caption, playback, previous } = this.room;
-    if (!video || message.video !== video.id) return;
+    const { caption, playback, previous } = this.room;
+    if (message.video !== FILM.id) return;
+    if (message.type === "prepared" && this.room.pending?.id === message.position) {
+      const attendee = socket.deserializeAttachment();
+      if (attendee) {
+        attendee.prepared = message.position;
+        socket.serializeAttachment(attendee);
+      }
+      await this.resumeWhenReady(now);
+      return;
+    }
     if (message.type === "captions" && caption) {
       caption.enabled = !caption.enabled;
       await this.save();
       return;
     }
-    if (!["play", "pause", "seek", "skip"].includes(message.type)) return;
+    if (!["play", "pause", "seek", "skip", "resync"].includes(message.type)) return;
     if (["seek", "skip"].includes(message.type) && !Number.isFinite(message.position)) return;
     const active = previous && now < playback.at ? previous : playback;
-    const at = now + 300;
+    const pending = this.room.pending;
+    if (message.type === "resync" && (pending || !active.playing || now - active.at < 2800)) return;
+    const at = message.type === "pause" && !pending ? now + 350 : now;
     let target = position(playback, at);
     if (message.type === "seek") target = message.position;
     if (message.type === "skip") target += Math.max(-30, Math.min(30, message.position));
-    const playing = message.type === "play" || (message.type !== "pause" && playback.playing);
-    if (playing && message.type === "play" && target >= video.duration - 0.08) target = 0;
-    target = Math.min(video.duration, Math.max(0, target));
-    this.room.previous = active;
-    this.room.playback = {
-      at, position: target, playing: playing && target < video.duration,
-      jump: playback.jump + (Math.abs(target - position(playback, at)) > 0.01 ? 1 : 0)
-    };
+    const playing = message.type === "play" || (message.type !== "pause" && (pending || playback.playing));
+    if (playing && message.type === "play" && target >= FILM.duration - 0.08) target = 0;
+    target = Math.min(FILM.duration, Math.max(0, target));
+    const jump = playback.jump + (message.type === "pause" ? 0 : 1);
+    this.room.previous = message.type === "pause" && !pending ? active : null;
+    this.room.playback = { at, position: target, playing: false, jump };
+    this.room.pending = playing && target < FILM.duration ? {
+      id: this.room.revision + 1,
+      deadline: now + 14000,
+      attendees: this.ctx.getWebSockets().filter(client => client.readyState === WebSocket.OPEN).map(client => {
+        let attendee = client.deserializeAttachment();
+        if (!attendee) {
+          attendee = { id: crypto.randomUUID(), prepared: null };
+          client.serializeAttachment(attendee);
+        }
+        return attendee.id;
+      })
+    } : null;
     await this.save();
   }
 
-  webSocketClose(socket, code) {
+  async resumeWhenReady(now, disconnected) {
+    const pending = this.room?.pending;
+    if (!pending) return;
+    const attendees = this.ctx.getWebSockets()
+      .filter(socket => socket !== disconnected && socket.readyState === WebSocket.OPEN)
+      .map(socket => socket.deserializeAttachment())
+      .filter(attendee => attendee && pending.attendees.includes(attendee.id));
+    const allReady = attendees.length > 0 && attendees.every(attendee => attendee.prepared === pending.id);
+    if (!allReady && attendees.length > 0 && now < pending.deadline) return;
+    this.room.pending = null;
+    if (allReady) {
+      this.room.previous = this.room.playback;
+      this.room.playback = { ...this.room.playback, at: now + 550, playing: true };
+    }
+    await this.save();
+  }
+
+  async webSocketClose(socket, code) {
     if (code !== 1006) socket.close(code);
+    if (this.room?.until > Date.now()) await this.resumeWhenReady(Date.now(), socket);
   }
 
   key(id, type) {
     return this.ctx.id.toString() + "/" + type + "/" + id;
   }
 
-  async upload(request, id, sub) {
-    const bucket = this.env.MEDIA;
-    const method = request.method;
-    if (!id && method === "POST") {
-      if (this.starting || this.pending) return fail("An upload is already in progress.", 409);
-      const data = await readJSON(request, 1024);
-      if (!data) return fail("Invalid video details.");
-      const type = TYPES.get(String(data.name).split(".").at(-1).toLowerCase());
-      if (!type || !Number.isInteger(data.size) || data.size < 8 || data.size > MAX ||
-          !Number.isFinite(data.duration) || data.duration <= 0 || data.duration > 86400) {
-        return fail("Choose an MP4 or WebM video under 3 GB.");
-      }
-      if (this.starting || this.pending) return fail("An upload is already in progress.", 409);
-      this.starting = true;
-      try {
-        const newId = crypto.randomUUID();
-        const key = this.key(newId, "video");
-        const upload = await bucket.createMultipartUpload(key, { httpMetadata: { contentType: type } });
-        this.pending = {
-          uploadId: upload.uploadId, id: newId, key, type, size: data.size, duration: data.duration,
-          name: String(data.name).slice(0, 180)
-        };
-        await this.ctx.storage.put("pending", this.pending);
-        return json({ id: newId, partSize: PART }, 201);
-      } finally {
-        this.starting = false;
-      }
-    }
-    if (!this.pending || id !== this.pending.id) return fail("Upload session expired.", 404);
-    const pending = this.pending;
-    const upload = bucket.resumeMultipartUpload(pending.key, pending.uploadId);
-    if (method === "DELETE" && !sub) {
-      if (this.completing) return fail("Upload is finishing.", 409);
-      await upload.abort();
-      if (this.pending === pending) {
-        this.pending = null;
-        await this.ctx.storage.delete("pending");
-      }
-      return json({ ok: true });
-    }
-    if (method === "PUT" && /^\d+$/.test(sub || "")) {
-      const part = Number(sub);
-      const size = Math.min(PART, pending.size - (part - 1) * PART);
-      if (part < 1 || size <= 0 || Number(request.headers.get("Content-Length")) !== size || !request.body) {
-        return fail("Invalid upload part.");
-      }
-      return json(await upload.uploadPart(part, request.body));
-    }
-    if (method === "POST" && sub === "complete") {
-      const data = await readJSON(request, 16384);
-      if (!Array.isArray(data?.parts) || data.parts.length !== Math.ceil(pending.size / PART) ||
-          data.parts.some((part, i) => part?.partNumber !== i + 1 || typeof part.etag !== "string")) {
-        return fail("Upload is incomplete.");
-      }
-      if (this.completing || this.pending !== pending) return fail("Upload is finishing.", 409);
-      this.completing = true;
-      try {
-        const object = await upload.complete(data.parts);
-        if (object.size !== pending.size) {
-          await bucket.delete(pending.key);
-          throw new Error("Unexpected uploaded file size");
-        }
-        const { video, caption } = this.room;
-        this.room.video = { id, size: pending.size, duration: pending.duration, type: pending.type, name: pending.name };
-        this.room.caption = null;
-        this.room.playback = { at: Date.now(), position: 0, playing: false, jump: 0 };
-        this.room.previous = null;
-        this.pending = null;
-        await this.ctx.storage.delete("pending");
-        await this.save();
-        const oldKeys = [video && this.key(video.id, "video"), caption && this.key(caption.id, "caption")].filter(Boolean);
-        if (oldKeys.length) this.ctx.waitUntil(bucket.delete(oldKeys));
-        return json(this.snapshot());
-      } finally {
-        this.completing = false;
-      }
-    }
-    return fail("Upload action unavailable.", 405);
+  filmKey() {
+    return this.env.ROOMS.idFromName(FILM_ROOM).toString() + "/video/" + FILM.id;
   }
 
   async caption(request, videoId) {
-    if (videoId !== this.room.video?.id) return fail("Choose a film first.");
+    if (videoId !== FILM.id) return fail("Film unavailable.", 404);
     const text = await readText(request, 1024 * 1024);
-    if (!text || !/^WEBVTT(?:[\t \r\n]|$)/.test(text)) return fail("Choose a valid SRT or VTT captions file.");
+    if (!text || !/^WEBVTT(?:[\t \r\n]|$)/.test(text) ||
+        !/^(?:\d{2,}:)?\d{2}:\d{2}\.\d{3}[ \t]+-->[ \t]+(?:\d{2,}:)?\d{2}:\d{2}\.\d{3}/m.test(text)) {
+      return fail("Choose an SRT or VTT file with timed captions.");
+    }
     const id = crypto.randomUUID();
     const key = this.key(id, "caption");
     await this.env.MEDIA.put(key, text);
-    if (videoId !== this.room.video?.id) {
-      this.ctx.waitUntil(this.env.MEDIA.delete(key));
-      return fail("The film changed. Upload the captions again.", 409);
-    }
     const old = this.room.caption;
     this.room.caption = { id, enabled: true, size: new TextEncoder().encode(text).length };
     await this.save();
@@ -264,7 +236,19 @@ export class Room extends DurableObject {
   }
 
   async media(request, type, id) {
-    const asset = type === "video" ? this.room.video : type === "caption" ? this.room.caption : null;
+    if (type === "preview" && /^[1-7]$/.test(id)) {
+      const key = "film-previews/rise-of-the-planet-of-the-apes-" + id + ".jpg";
+      const isHead = request.method === "HEAD";
+      const image = await (isHead ? this.env.MEDIA.head(key) : this.env.MEDIA.get(key));
+      if (!image) return fail("Preview unavailable.", 404);
+      return new Response(isHead ? null : image.body, { headers: {
+        "Content-Type": "image/jpeg",
+        "Content-Length": image.size,
+        "Cache-Control": "private, max-age=86400",
+        ETag: image.httpEtag
+      } });
+    }
+    const asset = type === "video" ? FILM : type === "caption" ? this.room.caption : null;
     if (!asset || id !== asset.id) return fail("File unavailable.", 404);
     const headers = new Headers({
       "Content-Type": type === "video" ? asset.type : "text/vtt; charset=utf-8",
@@ -288,28 +272,31 @@ export class Room extends DurableObject {
       }
       if (!range) return new Response(null, { status: 416, headers: { "Content-Range": "bytes */" + asset.size } });
     }
-    const object = await this.env.MEDIA.get(this.key(id, type), range ? { range } : {});
+    const key = type === "video" ? this.filmKey() : this.key(id, type);
+    const object = await this.env.MEDIA.get(key, range ? { range } : {});
     if (!object) return fail("File unavailable.", 404);
     headers.set("ETag", object.httpEtag);
     return new Response(object.body, { status: range ? 206 : 200, headers });
   }
 
   async alarm() {
-    if (this.pending) {
-      const { key, uploadId } = this.pending;
+    const pending = await this.ctx.storage.get("pending");
+    if (pending) {
+      const { key, uploadId } = pending;
       await this.env.MEDIA.resumeMultipartUpload(key, uploadId).abort();
     }
     const prefix = this.ctx.id.toString() + "/";
+    const filmKey = this.filmKey();
     let cursor;
     do {
       const page = await this.env.MEDIA.list({ prefix, cursor });
-      if (page.objects.length) await this.env.MEDIA.delete(page.objects.map(item => item.key));
+      const keys = page.objects.map(item => item.key).filter(key => key !== filmKey);
+      if (keys.length) await this.env.MEDIA.delete(keys);
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
     for (const socket of this.ctx.getWebSockets()) socket.close(4004, "Room expired");
     await this.ctx.storage.deleteAll();
     this.room = null;
-    this.pending = null;
   }
 }
 
@@ -328,13 +315,5 @@ async function readText(request, limit) {
       return null;
     }
     text += decoder.decode(value, { stream: true });
-  }
-}
-
-async function readJSON(request, limit) {
-  try {
-    return JSON.parse(await readText(request, limit));
-  } catch {
-    return null;
   }
 }
