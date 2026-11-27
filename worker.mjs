@@ -12,23 +12,39 @@ const RISE = {
   height: 816,
   name: "Rise of the Planet of the Apes (2011)"
 };
-const DAWN_KEY = "films/dawn-2014-r1.mp4";
-const DAWN_ID = "dawn-2014-r1";
 const DAWN = {
-  slug: "dawn", id: DAWN_ID, name: "Dawn of the Planet of the Apes (2014)",
+  slug: "dawn", id: "dawn-2014-r1", name: "Dawn of the Planet of the Apes (2014)",
   size: 2669627101, duration: 7824.277, type: "video/mp4", width: 1920, height: 1040
 };
-const previewNames = {
-  rise: "rise-of-the-planet-of-the-apes",
-  dawn: "dawn-of-the-planet-of-the-apes"
+const WAR = {
+  slug: "war", id: "war-2017-r1", name: "War for the Planet of the Apes (2017)",
+  size: 1922405258, duration: 8409.288167, type: "video/mp4", width: 1920, height: 800
 };
+const warCaptions = {
+  key: "films/war-2017-en.vtt",
+  asset: { id: "war-2017-en", size: 38174, enabled: false }
+};
+const library = [
+  { video: RISE, previewName: "rise-of-the-planet-of-the-apes" },
+  { video: DAWN, key: "films/dawn-2014-r1.mp4", previewName: "dawn-of-the-planet-of-the-apes" },
+  { video: WAR, key: "films/war-2017-r1.mp4", previewName: "war-for-the-planet-of-the-apes", captions: warCaptions }
+];
+const filmsById = new Map(library.map(item => [item.video.id, item]));
 const json = (data, status = 200) => Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
 const fail = (error, status = 400) => json({ error }, status);
 const position = (playback, at) => playback.position + (playback.playing ? Math.max(0, at - playback.at) / 1000 : 0);
 
-async function findDawn(env) {
-  const file = await env.MEDIA.head(DAWN_KEY);
-  return file?.size === DAWN.size ? DAWN : null;
+async function availableFilm(env, item) {
+  if (!item) return null;
+  if (!item.key) return item.video;
+  const file = await env.MEDIA.head(item.key);
+  if (file?.size !== item.video.size) return null;
+  if (item.captions) {
+    const preview = "film-previews/" + item.previewName + "-" + Math.ceil(item.video.duration / 960) + ".jpg";
+    const [captions, lastPreview] = await Promise.all([env.MEDIA.head(item.captions.key), env.MEDIA.head(preview)]);
+    if (captions?.size !== item.captions.asset.size || !lastPreview) return null;
+  }
+  return item.video;
 }
 
 function roomCode() {
@@ -50,7 +66,7 @@ export default {
         "Access-Control-Max-Age": "7200"
       } });
     } else if (pathname === "/api/films" && request.method === "GET") {
-      const films = [RISE, await findDawn(env)].filter(Boolean);
+      const films = (await Promise.all(library.map(item => availableFilm(env, item)))).filter(Boolean);
       response = json(films.map(({ slug, name }) => ({ slug, name })));
     } else if (pathname === "/api/rooms" && request.method === "POST") {
       const key = request.headers.get("CF-Connecting-IP") || "local";
@@ -58,7 +74,7 @@ export default {
         response = fail("Room limit reached. Try again in a minute.", 429);
       } else {
         const choice = request.body ? await readText(request, 32) : "";
-        const video = choice === "" || choice === "rise" ? RISE : choice === "dawn" ? await findDawn(env) : null;
+        const video = await availableFilm(env, library.find(item => item.video.slug === (choice === "" ? "rise" : choice)));
         response = fail("This film is unavailable.", 404);
         if (video) {
           for (let attempt = 0; attempt < 3; attempt++) {
@@ -97,7 +113,7 @@ export class Room extends DurableObject {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       this.room = await ctx.storage.get("room");
-      if (!this.room || [RISE.id, DAWN_ID].includes(this.room.video?.id)) return;
+      if (!this.room || filmsById.has(this.room.video?.id)) return;
       this.room.video = RISE;
       this.room.caption = null;
       this.room.previous = null;
@@ -106,8 +122,12 @@ export class Room extends DurableObject {
     });
   }
 
+  get film() {
+    return filmsById.get(this.room.video?.id) ?? library[0];
+  }
+
   get video() {
-    return this.room.video?.id === DAWN_ID ? this.room.video : RISE;
+    return this.film.video;
   }
 
   snapshot() {
@@ -131,8 +151,9 @@ export class Room extends DurableObject {
       if (this.room) return fail("Code in use.", 409);
       const { code, video } = await request.json();
       const now = Date.now();
+      const defaultCaptions = filmsById.get(video.id)?.captions?.asset;
       this.room = {
-        code, until: now + LIFETIME, video, caption: null, revision: 0,
+        code, until: now + LIFETIME, video, caption: defaultCaptions ? { ...defaultCaptions } : null, revision: 0,
         playback: { at: now, position: 0, playing: false, jump: 0 }
       };
       await this.ctx.storage.put("room", this.room);
@@ -263,14 +284,16 @@ export class Room extends DurableObject {
     const old = this.room.caption;
     this.room.caption = { id, enabled: true, size: new TextEncoder().encode(text).length };
     await this.save();
-    if (old) this.ctx.waitUntil(this.env.MEDIA.delete(this.key(old.id, "caption")));
+    if (old && old.id !== this.film.captions?.asset.id) {
+      this.ctx.waitUntil(this.env.MEDIA.delete(this.key(old.id, "caption")));
+    }
     return json(this.snapshot());
   }
 
   async media(request, type, id) {
     const film = this.video;
     if (type === "preview" && /^[1-9]\d?$/.test(id) && Number(id) <= Math.ceil(film.duration / 960)) {
-      const key = "film-previews/" + previewNames[film.slug] + "-" + id + ".jpg";
+      const key = "film-previews/" + this.film.previewName + "-" + id + ".jpg";
       const isHead = request.method === "HEAD";
       const image = await (isHead ? this.env.MEDIA.head(key) : this.env.MEDIA.get(key));
       if (!image) return fail("Preview unavailable.", 404);
@@ -305,7 +328,9 @@ export class Room extends DurableObject {
       }
       if (!range) return new Response(null, { status: 416, headers: { "Content-Range": "bytes */" + asset.size } });
     }
-    const key = type === "video" ? (film.slug === "dawn" ? DAWN_KEY : this.riseKey()) : this.key(id, type);
+    const builtInCaptions = this.film.captions;
+    const key = type === "video" ? (this.film.key ?? this.riseKey())
+      : id === builtInCaptions?.asset.id ? builtInCaptions.key : this.key(id, type);
     const object = await this.env.MEDIA.get(key, range ? { range } : {});
     if (!object) return fail("File unavailable.", 404);
     headers.set("ETag", object.httpEtag);
